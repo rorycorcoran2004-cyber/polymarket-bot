@@ -107,9 +107,11 @@ def get_markets():
             params={"active": "true", "closed": "false", "tag_slug": "crypto"},
             timeout=12,
         )
-        return r.json()
+        data = r.json()
+        log.info(f"  📡 Polymarket returned {len(data)} markets")
+        return data
     except Exception as e:
-        log.error(f"Market fetch failed: {e}")
+        log.error(f"  ❌ Market fetch failed: {e}")
         return []
 
 def classify(question):
@@ -132,7 +134,7 @@ def get_prices(token_id):
         ask = float(asks[0]["price"]) if asks else None
         bid = float(bids[0]["price"]) if bids else None
         return ask, bid
-    except:
+    except Exception as e:
         return None, None
 
 def run():
@@ -172,24 +174,45 @@ def run():
             markets = get_markets()
             best_opp = None
             best_edge = 0
+            matched = 0
+            no_prices = 0
 
             for m in markets:
                 q = m.get("question", "")
                 asset, tf = classify(q)
                 if not asset:
                     continue
+
+                matched += 1
                 mom = feed.momentum(asset, 60)
                 if mom is None:
                     continue
+
                 tokens = m.get("tokens", [])
                 yes_tok = next((t for t in tokens if t.get("outcome") == "Yes"), None)
                 no_tok  = next((t for t in tokens if t.get("outcome") == "No"), None)
                 if not yes_tok or not no_tok:
                     continue
+
                 yes_ask, _ = get_prices(yes_tok["token_id"])
                 no_ask,  _ = get_prices(no_tok["token_id"])
+
                 if not yes_ask or not no_ask:
+                    no_prices += 1
                     continue
+
+                # Log every market we can actually see prices for
+                decay = 1.0 / (tf ** 0.55)
+                shift = max(-0.30, min(0.30, mom * decay * 0.10))
+                p_yes = 0.50 + shift
+                p_no  = 1.0 - p_yes
+                yes_edge = p_yes - yes_ask
+                no_edge  = p_no  - no_ask
+                hedge = 1.0 - (yes_ask + no_ask)
+
+                log.info(f"  📊 {asset} {tf}m | YES={yes_ask:.3f} NO={no_ask:.3f} | "
+                         f"edge_yes={yes_edge:+.3f} edge_no={no_edge:+.3f} hedge={hedge:+.3f}")
+
                 hedge_profit = 1.0 - (yes_ask + no_ask)
                 if hedge_profit > 0.02:
                     log.info(f"  🔒 HEDGE found! π={hedge_profit:.4f} | {q[:50]}")
@@ -198,12 +221,7 @@ def run():
                         wallet.bet("HEDGE-NO",  asset, q, no_ask,  5.0)
                         last_trade = time.time()
                     continue
-                decay = 1.0 / (tf ** 0.55)
-                shift = max(-0.30, min(0.30, mom * decay * 0.10))
-                p_yes = 0.50 + shift
-                p_no  = 1.0 - p_yes
-                yes_edge = p_yes - yes_ask
-                no_edge  = p_no  - no_ask
+
                 if yes_edge > best_edge and yes_edge > 0.02:
                     best_edge = yes_edge
                     best_opp = {"dir": "YES", "asset": asset, "q": q, "price": yes_ask, "edge": yes_edge}
@@ -211,8 +229,10 @@ def run():
                     best_edge = no_edge
                     best_opp = {"dir": "NO", "asset": asset, "q": q, "price": no_ask, "edge": no_edge}
 
+            log.info(f"  ℹ️  Matched {matched} crypto markets | {no_prices} had no prices")
+
             if best_opp and time.time() - last_trade > 30:
-                log.info(f"  🎯 Best opportunity: {best_opp['dir']} {best_opp['asset']} | edge={best_opp['edge']:.3f}")
+                log.info(f"  🎯 Best: {best_opp['dir']} {best_opp['asset']} | edge={best_opp['edge']:.3f}")
                 wallet.bet(best_opp["dir"], best_opp["asset"], best_opp["q"], best_opp["price"], 5.0)
                 last_trade = time.time()
             else:
