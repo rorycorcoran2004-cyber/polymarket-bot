@@ -1,23 +1,12 @@
 """
 Polymarket Kyle's Lambda Bot
-==============================
-Watches real order flow on Polymarket.
-When a large order moves the price more than expected (high λ),
-it means an informed trader just bet with confidence.
-We copy their position automatically.
-
-Kyle's Lambda: λ = ΔP / Q
-  ΔP = price change after the order
-  Q  = size of the order in USDC
-  
-High λ = smart money signal → copy the trade
-Low  λ = noise → ignore
+Watches real order flow. When a large order moves price more than
+expected (high lambda), someone informed just bet. We copy them.
 """
 
 import json, time, logging, random, requests, sys
 from datetime import datetime
 from collections import deque
-import threading, websocket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,42 +15,38 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────
-LAMBDA_THRESHOLD  = 0.000005   # minimum λ to consider "informed" trade
-MIN_ORDER_SIZE    = 200        # ignore orders smaller than $200 (noise)
-BET_AMOUNT        = 5.0        # paper $ per trade
-COPY_WINDOW_SEC   = 60         # seconds to watch for follow-up confirmation
-MAX_MARKETS       = 30         # how many markets to monitor at once
-SCAN_INTERVAL     = 20         # seconds between full scans
+LAMBDA_THRESHOLD = 0.000005
+MIN_ORDER_SIZE   = 100
+BET_AMOUNT       = 5.0
+SCAN_INTERVAL    = 20
 
-ASSET_KEYWORDS = {
-    "BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "eth"],
-    "SOL": ["solana", "sol"], "XRP": ["xrp", "ripple"],
-}
+# Broad keyword list to catch all market phrasings
+CRYPTO_KEYWORDS = [
+    "btc", "bitcoin", "eth", "ethereum", "sol", "solana",
+    "xrp", "ripple", "crypto", "bnb", "doge", "dogecoin",
+    "higher", "lower", "above", "below", "price", "up or down"
+]
 
-# ── Paper Wallet ──────────────────────────────────────────────────────
 class PaperWallet:
     def __init__(self, balance=500.0):
         self.balance = balance
         self.start   = balance
         self.wins = self.losses = 0
-        self.trades = []
 
-    def bet(self, direction, market, amount, reason):
+    def bet(self, direction, question, amount, lam, size):
         if amount > self.balance:
             return
         self.balance -= amount
-        # Simulate outcome — real version would wait for resolution
-        won = random.random() < 0.54   # slight edge assumed from informed flow
-        payout = amount * (1.85 if won else 0)   # ~1.85x on binary market
+        won = random.random() < 0.54
+        payout = amount * (1.85 if won else 0)
         pnl = payout - amount
         self.balance += payout
         self.wins   += 1 if won else 0
         self.losses += 0 if won else 1
         emoji = "✅ WIN" if won else "❌ LOSS"
         log.info(f"  {emoji} | {direction} | ${amount:.2f} → ${pnl:+.2f} | Balance=${self.balance:.2f}")
-        log.info(f"       Reason: {reason}")
-        self.trades.append({"direction": direction, "pnl": pnl, "won": won, "market": market})
+        log.info(f"       λ={lam:.8f} on ${size:.0f} order")
+        log.info(f"       Market: {question[:55]}")
 
     def summary(self):
         total = self.wins + self.losses
@@ -69,87 +54,53 @@ class PaperWallet:
         roi = (self.balance - self.start) / self.start
         log.info(f"\n{'='*55}")
         log.info(f"  💰 Balance: ${self.balance:.2f} | ROI: {roi:+.1%}")
-        log.info(f"  🎯 Win rate: {wr} ({self.wins}W / {self.losses}L / {total} trades)")
+        log.info(f"  🎯 Win rate: {wr} ({self.wins}W/{self.losses}L/{total} trades)")
         log.info(f"{'='*55}\n")
 
-
-# ── Order Flow Tracker ────────────────────────────────────────────────
-class OrderFlowTracker:
-    """
-    Tracks recent trades per market token.
-    Calculates Kyle's Lambda when a large order comes in.
-    """
-    def __init__(self):
-        # token_id → deque of {price, size, time}
-        self.history: dict[str, deque] = {}
-        self.last_price: dict[str, float] = {}
-
-    def record(self, token_id: str, price: float, size: float):
-        if token_id not in self.history:
-            self.history[token_id] = deque(maxlen=50)
-        self.history[token_id].append({
-            "price": price, "size": size, "t": time.time()
-        })
-        self.last_price[token_id] = price
-
-    def kyle_lambda(self, token_id: str) -> tuple[float, float, str]:
-        """
-        Returns (lambda, order_size, direction) for the most recent large order.
-        direction: 'YES' or 'NO'
-        """
-        if token_id not in self.history or len(self.history[token_id]) < 2:
-            return 0.0, 0.0, ""
-
-        trades = list(self.history[token_id])
-        latest = trades[-1]
-        prev   = trades[-2]
-
-        size = latest["size"]
-        if size < MIN_ORDER_SIZE:
-            return 0.0, 0.0, ""
-
-        delta_p = abs(latest["price"] - prev["price"])
-        if delta_p == 0 or size == 0:
-            return 0.0, 0.0, ""
-
-        lam = delta_p / size
-        direction = "YES" if latest["price"] > prev["price"] else "NO"
-        return lam, size, direction
-
-
-# ── Polymarket API ────────────────────────────────────────────────────
-def get_markets(limit=MAX_MARKETS) -> list[dict]:
-    """Fetch active crypto prediction markets."""
+def get_markets() -> list[dict]:
+    """Fetch active markets — no tag filter so we get everything."""
     try:
         r = requests.get(
             "https://gamma-api.polymarket.com/markets",
-            params={"active": "true", "closed": "false",
-                    "tag_slug": "crypto", "limit": limit},
+            params={"active": "true", "closed": "false", "limit": 50},
             timeout=12,
         )
-        markets = r.json()
-        log.info(f"  📡 {len(markets)} markets fetched")
-        return markets
+        all_markets = r.json()
+
+        # Filter locally using broad keyword list
+        crypto = []
+        for m in all_markets:
+            q = m.get("question", "").lower()
+            if any(kw in q for kw in CRYPTO_KEYWORDS):
+                crypto.append(m)
+
+        log.info(f"  📡 {len(all_markets)} total markets → {len(crypto)} crypto-related")
+
+        # Debug: show what we found
+        for m in crypto[:5]:
+            log.info(f"     ✓ {m.get('question','')[:60]}")
+
+        return crypto
     except Exception as e:
         log.error(f"  ❌ Market fetch failed: {e}")
         return []
 
-
 def get_recent_trades(token_id: str) -> list[dict]:
-    """Get recent trades for a token from CLOB."""
     try:
         r = requests.get(
-            f"https://clob.polymarket.com/trades",
+            "https://clob.polymarket.com/trades",
             params={"token_id": token_id, "limit": 20},
             timeout=8,
         )
-        return r.json().get("data", [])
+        data = r.json()
+        if isinstance(data, dict):
+            return data.get("data", [])
+        return []
     except:
         return []
 
-
-def get_current_price(token_id: str) -> float | None:
-    """Get best ask price for a token."""
+def get_book(token_id: str) -> tuple:
+    """Returns (ask, bid) prices."""
     try:
         r = requests.get(
             f"https://clob.polymarket.com/book?token_id={token_id}",
@@ -157,99 +108,51 @@ def get_current_price(token_id: str) -> float | None:
         )
         data = r.json()
         asks = data.get("asks", [])
-        return float(asks[0]["price"]) if asks else None
+        bids = data.get("bids", [])
+        ask = float(asks[0]["price"]) if asks else None
+        bid = float(bids[0]["price"]) if bids else None
+        return ask, bid
     except:
-        return None
+        return None, None
 
-
-def classify(question: str) -> str | None:
-    q = question.lower()
-    for asset, kws in ASSET_KEYWORDS.items():
-        if any(k in q for k in kws):
-            return asset
-    return None
-
-
-# ── Signal Detector ───────────────────────────────────────────────────
-class SignalDetector:
+def calc_lambda(trades: list[dict]) -> tuple[float, float, str]:
     """
-    For each market, fetches recent trades and checks if a large
-    informed order just moved the price more than expected.
+    Kyle's Lambda: λ = ΔP / Q
+    Returns (lambda, order_size_usdc, direction)
     """
-    def __init__(self):
-        self.tracker = OrderFlowTracker()
-        self.alerted: set[str] = set()   # avoid double-triggering
+    if len(trades) < 2:
+        return 0.0, 0.0, ""
+    try:
+        latest = trades[0]   # most recent
+        prev   = trades[1]
 
-    def check_market(self, market: dict) -> dict | None:
-        """
-        Returns a signal dict if informed flow detected, else None.
-        """
-        q = market.get("question", "")
-        asset = classify(q)
-        if not asset:
-            return None
+        price_now  = float(latest.get("price", 0))
+        price_prev = float(prev.get("price", 0))
+        size_shares = float(latest.get("size", 0))
+        size_usdc   = size_shares * price_now
 
-        tokens = market.get("tokens", [])
-        yes_tok = next((t for t in tokens if t.get("outcome") == "Yes"), None)
-        no_tok  = next((t for t in tokens if t.get("outcome") == "No"),  None)
-        if not yes_tok or not no_tok:
-            return None
+        if size_usdc < MIN_ORDER_SIZE or price_prev == 0:
+            return 0.0, 0.0, ""
 
-        for tok, label in [(yes_tok, "YES"), (no_tok, "NO")]:
-            tid = tok.get("token_id", "")
-            trades = get_recent_trades(tid)
+        delta_p = abs(price_now - price_prev)
+        lam = delta_p / size_usdc
+        direction = "YES" if price_now > price_prev else "NO"
+        return lam, size_usdc, direction
+    except:
+        return 0.0, 0.0, ""
 
-            if not trades:
-                continue
-
-            # Feed trades into tracker
-            for trade in reversed(trades):   # oldest first
-                try:
-                    price = float(trade.get("price", 0))
-                    size  = float(trade.get("size", 0)) * price   # convert to USDC
-                    self.tracker.record(tid, price, size)
-                except:
-                    continue
-
-            # Calculate Kyle's Lambda
-            lam, size, direction = self.tracker.kyle_lambda(tid)
-
-            if lam >= LAMBDA_THRESHOLD and size >= MIN_ORDER_SIZE:
-                alert_key = f"{tid}_{round(lam, 7)}"
-                if alert_key in self.alerted:
-                    continue
-                self.alerted.add(alert_key)
-
-                current_price = self.tracker.last_price.get(tid)
-                return {
-                    "market_id": market.get("conditionId", ""),
-                    "question": q,
-                    "asset": asset,
-                    "token_id": tid,
-                    "token_label": label,
-                    "direction": direction,
-                    "lambda": lam,
-                    "order_size": size,
-                    "price": current_price,
-                }
-
-        return None
-
-
-# ── Main Bot ──────────────────────────────────────────────────────────
 def run():
     log.info("="*55)
     log.info("  🤖  Polymarket Kyle's Lambda Bot")
-    log.info("  Strategy: Copy informed order flow")
-    log.info("  Mode: PAPER (no real money)")
-    log.info(f"  Min order size: ${MIN_ORDER_SIZE}")
-    log.info(f"  Lambda threshold: {LAMBDA_THRESHOLD}")
+    log.info("  Strategy: Follow informed order flow")
+    log.info("  Mode: PAPER — no real money")
+    log.info(f"  λ threshold: {LAMBDA_THRESHOLD} | Min order: ${MIN_ORDER_SIZE}")
     log.info("="*55)
 
-    wallet   = PaperWallet(balance=500.0)
-    detector = SignalDetector()
-    scan_count = 0
+    wallet = PaperWallet()
+    alerted = set()
     last_trade = 0
+    scan_count = 0
 
     while True:
         try:
@@ -257,54 +160,60 @@ def run():
             log.info(f"\n🔍 Scan #{scan_count} — {datetime.now().strftime('%H:%M:%S')}")
 
             markets = get_markets()
-            signals_found = 0
+            signals  = 0
 
             for market in markets:
-                signal = detector.check_market(market)
+                q      = market.get("question", "")
+                tokens = market.get("tokens", [])
 
-                if signal:
-                    signals_found += 1
-                    lam   = signal["lambda"]
-                    size  = signal["order_size"]
-                    price = signal["price"]
-                    q     = signal["question"]
-                    direction = signal["direction"]
-                    asset = signal["asset"]
+                for tok in tokens:
+                    tid    = tok.get("token_id", "")
+                    label  = tok.get("outcome", "")
+                    if not tid:
+                        continue
 
-                    log.info(f"\n  🚨 INFORMED FLOW DETECTED!")
-                    log.info(f"     Market : {q[:55]}")
-                    log.info(f"     Asset  : {asset}")
-                    log.info(f"     Signal : {direction}")
-                    log.info(f"     λ      : {lam:.8f} (threshold: {LAMBDA_THRESHOLD})")
-                    log.info(f"     Order  : ${size:.0f} moved price unusually far")
-                    log.info(f"     Price  : {price:.3f}")
+                    trades = get_recent_trades(tid)
+                    if not trades:
+                        continue
 
-                    # Only bet if cooldown has passed
-                    if time.time() - last_trade > 30:
-                        reason = (f"λ={lam:.8f} on ${size:.0f} order "
-                                  f"in '{q[:40]}'")
-                        wallet.bet(direction, q, BET_AMOUNT, reason)
-                        last_trade = time.time()
-                    else:
-                        log.info(f"     ⏳ Skipping — cooldown active")
+                    lam, size, direction = calc_lambda(trades)
 
-            if signals_found == 0:
-                log.info(f"  — No informed flow detected this scan")
-            else:
-                log.info(f"  ✓ {signals_found} signal(s) found this scan")
+                    if lam >= LAMBDA_THRESHOLD and size >= MIN_ORDER_SIZE:
+                        alert_key = f"{tid}_{trades[0].get('id','')}"
+                        if alert_key in alerted:
+                            continue
+                        alerted.add(alert_key)
+                        signals += 1
+
+                        ask, bid = get_book(tid)
+                        log.info(f"\n  🚨 INFORMED FLOW!")
+                        log.info(f"     {q[:55]}")
+                        log.info(f"     Token  : {label}")
+                        log.info(f"     Signal : {direction}")
+                        log.info(f"     λ      : {lam:.8f}")
+                        log.info(f"     Order  : ${size:.0f} USDC")
+                        log.info(f"     Price  : ask={ask} bid={bid}")
+
+                        if time.time() - last_trade > 30:
+                            wallet.bet(direction, q, BET_AMOUNT, lam, size)
+                            last_trade = time.time()
+                        else:
+                            log.info(f"     ⏳ Cooldown — skipping")
+
+            if signals == 0:
+                log.info("  — No informed flow this scan")
 
             wallet.summary()
             log.info(f"⏱  Next scan in {SCAN_INTERVAL}s...")
             time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
-            log.info("\n👋 Bot stopped")
+            log.info("\n👋 Stopped")
             wallet.summary()
             break
         except Exception as e:
             log.error(f"Error: {e}")
             time.sleep(10)
-
 
 if __name__ == "__main__":
     run()
