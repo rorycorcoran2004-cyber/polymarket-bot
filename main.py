@@ -1,10 +1,11 @@
 """
-Polymarket Kyle's Lambda Bot - Debug build
-Prints ALL market questions so we can see what's actually available.
+Polymarket Kyle's Lambda Bot
+Only trades markets that are LIVE RIGHT NOW.
+Watches for large orders that move price more than expected (high lambda).
 """
 
 import time, logging, random, requests, sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,14 +17,10 @@ log = logging.getLogger(__name__)
 LAMBDA_THRESHOLD = 0.000003
 MIN_ORDER_SIZE   = 50
 BET_AMOUNT       = 5.0
-SCAN_INTERVAL    = 30
+SCAN_INTERVAL    = 20
 
 CRYPTO_KEYWORDS = [
-    "btc", "bitcoin", "eth", "ethereum", "sol", "solana",
-    "xrp", "ripple", "crypto", "bnb", "doge", "dogecoin",
-    "higher", "lower", "above", "below", "up or down",
-    "price", "usd", "token", "coin", "market", "rally",
-    "pump", "dump", "bull", "bear", "trade", "exchange"
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp"
 ]
 
 class PaperWallet:
@@ -44,7 +41,7 @@ class PaperWallet:
         self.losses += 0 if won else 1
         emoji = "✅ WIN" if won else "❌ LOSS"
         log.info(f"  {emoji} | {direction} | ${amount:.2f} → ${pnl:+.2f} | Balance=${self.balance:.2f}")
-        log.info(f"       λ={lam:.8f} | order=${size:.0f} | {question[:50]}")
+        log.info(f"       λ={lam:.8f} | order=${size:.0f} | {question[:55]}")
 
     def summary(self):
         total = self.wins + self.losses
@@ -56,49 +53,62 @@ class PaperWallet:
         log.info(f"{'='*55}\n")
 
 
-def get_markets() -> list[dict]:
+def get_live_markets() -> list[dict]:
     """
-    Try multiple API endpoints and params to find active markets.
-    Print ALL questions so we can see what's there.
+    Fetch markets and keep only ones that are LIVE RIGHT NOW.
+    A market is live if: startDate <= now <= endDate
     """
     all_markets = {}
+    now = datetime.now(timezone.utc)
 
-    # Try 1: no filters at all, just get latest active markets
-    endpoints = [
-        {"active": "true", "closed": "false", "limit": 100},
-        {"active": "true", "closed": "false", "limit": 100, "order": "volume", "ascending": "false"},
-        {"active": "true", "closed": "false", "limit": 100, "order": "startDate", "ascending": "false"},
-    ]
-
-    for params in endpoints:
-        try:
-            r = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params=params,
-                timeout=12,
-            )
-            for m in r.json():
-                mid = m.get("conditionId", "")
-                if mid:
-                    all_markets[mid] = m
-            time.sleep(0.3)
-        except Exception as e:
-            log.error(f"  ❌ Fetch failed: {e}")
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"active": "true", "closed": "false", "limit": 100},
+            timeout=12,
+        )
+        for m in r.json():
+            mid = m.get("conditionId", "")
+            if mid:
+                all_markets[mid] = m
+    except Exception as e:
+        log.error(f"  ❌ Fetch failed: {e}")
+        return []
 
     markets = list(all_markets.values())
-    log.info(f"  📡 {len(markets)} total markets fetched")
+    live_crypto = []
 
-    # Print ALL questions so we can see what's available
-    log.info("  📋 ALL MARKET QUESTIONS:")
     for m in markets:
-        log.info(f"     | {m.get('question','')[:70]}")
+        q = m.get("question", "").lower()
 
-    # Filter for crypto
-    crypto = [m for m in markets
-              if any(kw in m.get("question","").lower() for kw in CRYPTO_KEYWORDS)]
+        # Must be a crypto market
+        if not any(kw in q for kw in CRYPTO_KEYWORDS):
+            continue
 
-    log.info(f"  🔍 {len(crypto)} matched crypto keywords")
-    return crypto
+        # Must be open right now — check start/end times
+        start_str = m.get("startDate") or m.get("startDateIso")
+        end_str   = m.get("endDate")   or m.get("endDateIso")
+
+        if start_str and end_str:
+            try:
+                # Parse ISO timestamps
+                start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+                end   = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                if not (start <= now <= end):
+                    continue   # not open yet, or already closed
+            except:
+                pass  # if we can't parse dates, include it anyway
+
+        live_crypto.append(m)
+
+    log.info(f"  📡 {len(markets)} total | {len(live_crypto)} crypto live now")
+    for m in live_crypto[:10]:
+        log.info(f"     🟢 {m.get('question','')[:60]}")
+
+    if not live_crypto:
+        log.info("  ⏰ No live crypto markets right now — waiting for next window")
+
+    return live_crypto
 
 
 def get_recent_trades(token_id: str) -> list[dict]:
@@ -128,6 +138,7 @@ def get_book(token_id: str) -> tuple:
 
 
 def calc_lambda(trades: list) -> tuple:
+    """λ = ΔP / Q"""
     if len(trades) < 2:
         return 0.0, 0.0, ""
     try:
@@ -148,8 +159,10 @@ def calc_lambda(trades: list) -> tuple:
 
 def run():
     log.info("="*55)
-    log.info("  🤖  Polymarket Kyle's Lambda Bot [DEBUG]")
-    log.info("  Printing all markets to find correct ones")
+    log.info("  🤖  Polymarket Kyle's Lambda Bot")
+    log.info("  Strategy: Follow informed order flow")
+    log.info("  Mode: PAPER — no real money")
+    log.info(f"  λ threshold: {LAMBDA_THRESHOLD} | Min order: ${MIN_ORDER_SIZE}")
     log.info("="*55)
 
     wallet     = PaperWallet()
@@ -160,9 +173,10 @@ def run():
     while True:
         try:
             scan_count += 1
-            log.info(f"\n🔍 Scan #{scan_count} — {datetime.now().strftime('%H:%M:%S')}")
+            now_str = datetime.now().strftime('%H:%M:%S')
+            log.info(f"\n🔍 Scan #{scan_count} — {now_str}")
 
-            markets = get_markets()
+            markets = get_live_markets()
             signals = 0
 
             for market in markets:
@@ -189,17 +203,20 @@ def run():
                         signals += 1
 
                         ask, bid = get_book(tid)
-                        log.info(f"\n  🚨 INFORMED FLOW!")
+                        log.info(f"\n  🚨 INFORMED FLOW DETECTED!")
                         log.info(f"     {q[:55]}")
                         log.info(f"     Token : {label} | Signal: {direction}")
-                        log.info(f"     λ     : {lam:.8f} | Order: ${size:.0f}")
+                        log.info(f"     λ     : {lam:.8f}")
+                        log.info(f"     Order : ${size:.0f} USDC | Price: ask={ask}")
 
                         if time.time() - last_trade > 30:
                             wallet.bet(direction, q, BET_AMOUNT, lam, size)
                             last_trade = time.time()
+                        else:
+                            log.info(f"     ⏳ Cooldown — skipping")
 
-            if signals == 0:
-                log.info("  — No informed flow this scan")
+            if signals == 0 and markets:
+                log.info("  — Markets live but no informed flow yet")
 
             wallet.summary()
             log.info(f"⏱  Next scan in {SCAN_INTERVAL}s...")
