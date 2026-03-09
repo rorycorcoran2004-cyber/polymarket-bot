@@ -10,7 +10,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-ASSET_PAIRS = {"BTC": "btcusdt", "ETH": "ethusdt", "SOL": "solusdt", "XRP": "xrpusdt"}
+ASSET_PAIRS = {"BTC": "XBT/USD", "ETH": "ETH/USD", "SOL": "SOL/USD", "XRP": "XRP/USD"}
 ASSET_KEYWORDS = {
     "BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "eth"],
     "SOL": ["solana", "sol"], "XRP": ["xrp", "ripple"],
@@ -57,20 +57,30 @@ class PriceFeed:
 
     def start(self):
         def on_message(ws, raw):
-            data = json.loads(raw)
-            stream = data.get("stream", "")
-            ticker = data.get("data", {})
-            for asset, pair in ASSET_PAIRS.items():
-                if stream.startswith(pair):
-                    p = float(ticker.get("c", 0) or 0)
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, list) or len(data) < 4:
+                    return
+                ticker = data[1]
+                pair = data[3]
+                mapping = {"XBT/USD": "BTC", "ETH/USD": "ETH", "SOL/USD": "SOL", "XRP/USD": "XRP"}
+                asset = mapping.get(pair)
+                if asset and isinstance(ticker, dict):
+                    p = float(ticker.get("c", [0])[0] or 0)
                     if p > 0:
                         self.current[asset] = p
                         self.prices[asset].append({"p": p, "t": time.time()})
+            except Exception as e:
+                pass
 
         def connect():
-            streams = "/".join(f"{p}@ticker" for p in ASSET_PAIRS.values())
             ws = websocket.WebSocketApp(
-                f"wss://stream.binance.com:9443/stream?streams={streams}",
+                "wss://ws.kraken.com",
+                on_open=lambda ws: ws.send(json.dumps({
+                    "event": "subscribe",
+                    "pair": ["XBT/USD", "ETH/USD", "SOL/USD", "XRP/USD"],
+                    "subscription": {"name": "ticker"}
+                })),
                 on_message=on_message,
                 on_close=lambda ws, *a: (time.sleep(3), connect()),
             )
@@ -129,6 +139,7 @@ def run():
     log.info("="*50)
     log.info("  🤖  Polymarket Paper Trading Bot")
     log.info("  Mode: PAPER (no real money)")
+    log.info("  Price feed: Kraken")
     log.info("="*50)
 
     wallet = PaperWallet(balance=500.0)
