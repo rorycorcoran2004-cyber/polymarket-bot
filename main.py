@@ -70,7 +70,7 @@ class PriceFeed:
                     if p > 0:
                         self.current[asset] = p
                         self.prices[asset].append({"p": p, "t": time.time()})
-            except Exception as e:
+            except Exception:
                 pass
 
         def connect():
@@ -204,10 +204,10 @@ def run():
                 p_no  = 1.0 - p_yes
                 yes_edge = p_yes - yes_ask
                 no_edge  = p_no  - no_ask
-                if yes_edge > best_edge and yes_edge > 0.06:
+                if yes_edge > best_edge and yes_edge > 0.02:
                     best_edge = yes_edge
                     best_opp = {"dir": "YES", "asset": asset, "q": q, "price": yes_ask, "edge": yes_edge}
-                elif no_edge > best_edge and no_edge > 0.06:
+                elif no_edge > best_edge and no_edge > 0.02:
                     best_edge = no_edge
                     best_opp = {"dir": "NO", "asset": asset, "q": q, "price": no_ask, "edge": no_edge}
 
